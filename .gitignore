@@ -1,0 +1,11 @@
+# Terraform local files
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/crash.log
+
+# Local editor / OS files
+.vscode/
+.DS_Store
+Thumbs.db
