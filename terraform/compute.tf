@@ -25,14 +25,22 @@ locals {
     systemctl start docker
 
     usermod -aG docker ubuntu
+
+    # Ensure AWS Systems Manager Agent is available
+    if ! snap list amazon-ssm-agent >/dev/null 2>&1; then
+      snap install amazon-ssm-agent --classic
+    fi
+
+    snap start amazon-ssm-agent || true
   EOF
 }
 
 resource "aws_instance" "blue" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public_a.id
-  vpc_security_group_ids = [aws_security_group.app.id]
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.instance_type
+  subnet_id                   = aws_subnet.public_a.id
+  associate_public_ip_address = true
+  vpc_security_group_ids      = [aws_security_group.app.id]
 
   iam_instance_profile = aws_iam_instance_profile.app_ec2.name
 
@@ -50,10 +58,11 @@ resource "aws_instance" "blue" {
 }
 
 resource "aws_instance" "green" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public_b.id
-  vpc_security_group_ids = [aws_security_group.app.id]
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.instance_type
+  subnet_id                   = aws_subnet.public_b.id
+  associate_public_ip_address = true
+  vpc_security_group_ids      = [aws_security_group.app.id]
 
   iam_instance_profile = aws_iam_instance_profile.app_ec2.name
 
