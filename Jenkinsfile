@@ -4,6 +4,7 @@ pipeline {
     options {
         timestamps()
         disableConcurrentBuilds()
+        skipDefaultCheckout(true)
     }
 
     parameters {
@@ -24,7 +25,8 @@ pipeline {
         BLUE_INSTANCE  = 'i-0d6bdc2e55911bfb5'
         GREEN_INSTANCE = 'i-090717305108a64a3'
 
-        BLUE_TG  = 'arn:aws:elasticloadbalancing:ap-south-1:849808307461:targetgroup/bluegreen-cicd-blue-tg/df3f77f6ad1b089c'
+        BLUE_TG = 'arn:aws:elasticloadbalancing:ap-south-1:849808307461:targetgroup/bluegreen-cicd-blue-tg/df3f77f6ad1b089c'
+
         GREEN_TG = 'arn:aws:elasticloadbalancing:ap-south-1:849808307461:targetgroup/bluegreen-cicd-green-tg/1e159b53ced6344e'
 
         LISTENER_ARN = 'arn:aws:elasticloadbalancing:ap-south-1:849808307461:listener/app/bluegreen-cicd-alb/faf6ba3901e10c70/a83fa517f38eb0ae'
@@ -53,6 +55,22 @@ pipeline {
         stage('Detect Active Environment') {
             steps {
                 script {
+
+                    /*
+                     * APP_VERSION comes from the Jenkins parameter.
+                     * The fallback also protects the first/older build
+                     * where Jenkins may not yet have registered parameters.
+                     */
+                    def version = params.APP_VERSION?.trim()
+
+                    if (!version) {
+                        version = '1.2.0'
+                    }
+
+                    env.APP_VERSION = version
+
+                    echo "Application version: ${env.APP_VERSION}"
+
                     def activeTg = sh(
                         script: '''
                             $AWS_CLI elbv2 describe-listeners \
@@ -64,23 +82,30 @@ pipeline {
                     ).trim()
 
                     if (activeTg == env.BLUE_TG) {
-                        env.ACTIVE_ENV      = 'BLUE'
-                        env.ACTIVE_TG       = env.BLUE_TG
-                        env.DEPLOY_ENV      = 'GREEN'
-                        env.DEPLOY_TG       = env.GREEN_TG
+
+                        env.ACTIVE_ENV = 'BLUE'
+                        env.ACTIVE_TG = env.BLUE_TG
+
+                        env.DEPLOY_ENV = 'GREEN'
+                        env.DEPLOY_TG = env.GREEN_TG
                         env.DEPLOY_INSTANCE = env.GREEN_INSTANCE
+
                     } else if (activeTg == env.GREEN_TG) {
-                        env.ACTIVE_ENV      = 'GREEN'
-                        env.ACTIVE_TG       = env.GREEN_TG
-                        env.DEPLOY_ENV      = 'BLUE'
-                        env.DEPLOY_TG       = env.BLUE_TG
+
+                        env.ACTIVE_ENV = 'GREEN'
+                        env.ACTIVE_TG = env.GREEN_TG
+
+                        env.DEPLOY_ENV = 'BLUE'
+                        env.DEPLOY_TG = env.BLUE_TG
                         env.DEPLOY_INSTANCE = env.BLUE_INSTANCE
+
                     } else {
+
                         error("Unable to determine active BLUE/GREEN environment")
                     }
 
                     echo "Current LIVE environment: ${env.ACTIVE_ENV}"
-                    echo "Deploying version ${params.APP_VERSION} to: ${env.DEPLOY_ENV}"
+                    echo "Deploying version ${env.APP_VERSION} to: ${env.DEPLOY_ENV}"
                 }
             }
         }
@@ -88,6 +113,9 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 sh '''
+                    echo "Building Docker image:"
+                    echo "$ECR_REPO:$APP_VERSION"
+
                     docker build \
                       -t "$ECR_REPO:$APP_VERSION" .
                 '''
@@ -97,7 +125,8 @@ pipeline {
         stage('Test Docker Image') {
             steps {
                 sh '''
-                    docker rm -f bluegreen-ci-test >/dev/null 2>&1 || true
+                    docker rm -f bluegreen-ci-test \
+                      >/dev/null 2>&1 || true
 
                     docker run -d \
                       --name bluegreen-ci-test \
@@ -108,10 +137,21 @@ pipeline {
 
                     sleep 2
 
-                    curl -fsS http://localhost:18080 > ci-response.html
+                    curl -fsS \
+                      http://localhost:18080 \
+                      > ci-response.html
 
-                    grep -q "Version: $APP_VERSION" ci-response.html
-                    grep -q "Environment: CI" ci-response.html
+                    grep -q \
+                      "Version: $APP_VERSION" \
+                      ci-response.html
+
+                    grep -q \
+                      "Environment: CI" \
+                      ci-response.html
+
+                    echo "Docker image test passed."
+
+                    cat ci-response.html
 
                     docker rm -f bluegreen-ci-test
                 '''
@@ -121,12 +161,17 @@ pipeline {
         stage('Push Image to ECR') {
             steps {
                 sh '''
+                    echo "Logging in to AWS ECR..."
+
                     $AWS_CLI ecr get-login-password \
                       --region "$AWS_REGION" |
                     docker login \
                       --username AWS \
                       --password-stdin \
                       "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+                    echo "Pushing image:"
+                    echo "$ECR_REPO:$APP_VERSION"
 
                     docker push "$ECR_REPO:$APP_VERSION"
                 '''
@@ -135,26 +180,60 @@ pipeline {
 
         stage('Prepare Inactive Environment') {
             steps {
-                sh '''
-                    cat > listener-prep.json <<EOF
-[
+                script {
+
+                    writeFile(
+                        file: 'listener-prep.json',
+                        text: """[
   {
     "Type": "forward",
     "ForwardConfig": {
       "TargetGroups": [
         {
-          "TargetGroupArn": "$ACTIVE_TG",
+          "TargetGroupArn": "${env.ACTIVE_TG}",
           "Weight": 100
         },
         {
-          "TargetGroupArn": "$DEPLOY_TG",
+          "TargetGroupArn": "${env.DEPLOY_TG}",
           "Weight": 0
         }
       ]
     }
   }
 ]
-EOF
+"""
+                    )
+
+                    /*
+                     * This is also our rollback configuration.
+                     * ACTIVE gets 100%, new environment gets 0%.
+                     */
+                    writeFile(
+                        file: 'listener-rollback.json',
+                        text: """[
+  {
+    "Type": "forward",
+    "ForwardConfig": {
+      "TargetGroups": [
+        {
+          "TargetGroupArn": "${env.ACTIVE_TG}",
+          "Weight": 100
+        },
+        {
+          "TargetGroupArn": "${env.DEPLOY_TG}",
+          "Weight": 0
+        }
+      ]
+    }
+  }
+]
+"""
+                    )
+                }
+
+                sh '''
+                    echo "Keeping production on $ACTIVE_ENV"
+                    echo "Preparing $DEPLOY_ENV with weight 0"
 
                     $AWS_CLI elbv2 modify-listener \
                       --listener-arn "$LISTENER_ARN" \
@@ -166,19 +245,27 @@ EOF
 
         stage('Deploy Using SSM') {
             steps {
-                sh '''
-                    cat > ssm-params.json <<EOF
-{
+                script {
+
+                    writeFile(
+                        file: 'ssm-params.json',
+                        text: """{
   "commands": [
     "set -e",
-    "/usr/local/bin/aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com",
-    "docker pull $ECR_REPO:$APP_VERSION",
+    "/usr/local/bin/aws ecr get-login-password --region ${env.AWS_REGION} | docker login --username AWS --password-stdin ${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com",
+    "docker pull ${env.ECR_REPO}:${env.APP_VERSION}",
     "docker rm -f bluegreen-app >/dev/null 2>&1 || true",
-    "docker run -d --name bluegreen-app --restart unless-stopped -e APP_VERSION=$APP_VERSION -e APP_ENVIRONMENT=$DEPLOY_ENV -p 80:80 $ECR_REPO:$APP_VERSION",
+    "docker run -d --name bluegreen-app --restart unless-stopped -e APP_VERSION=${env.APP_VERSION} -e APP_ENVIRONMENT=${env.DEPLOY_ENV} -p 80:80 ${env.ECR_REPO}:${env.APP_VERSION}",
     "docker ps --filter name=bluegreen-app"
   ]
 }
-EOF
+"""
+                    )
+                }
+
+                sh '''
+                    echo "Deploying to $DEPLOY_ENV"
+                    echo "Instance: $DEPLOY_INSTANCE"
 
                     COMMAND_ID=$(
                       $AWS_CLI ssm send-command \
@@ -195,10 +282,26 @@ EOF
                       --command-id "$COMMAND_ID" \
                       --instance-id "$DEPLOY_INSTANCE"
 
+                    STATUS=$(
+                      $AWS_CLI ssm get-command-invocation \
+                        --command-id "$COMMAND_ID" \
+                        --instance-id "$DEPLOY_INSTANCE" \
+                        --query 'Status' \
+                        --output text
+                    )
+
+                    echo "SSM deployment status: $STATUS"
+
                     $AWS_CLI ssm get-command-invocation \
                       --command-id "$COMMAND_ID" \
                       --instance-id "$DEPLOY_INSTANCE" \
-                      --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}'
+                      --query \
+                      '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}'
+
+                    if [ "$STATUS" != "Success" ]; then
+                        echo "SSM deployment failed."
+                        exit 1
+                    fi
                 '''
             }
         }
@@ -206,13 +309,17 @@ EOF
         stage('Wait For Health Check') {
             steps {
                 sh '''
+                    echo "Waiting for $DEPLOY_ENV target to become healthy..."
+
                     for attempt in $(seq 1 20)
                     do
+
                         STATE=$(
                           $AWS_CLI elbv2 describe-target-health \
                             --target-group-arn "$DEPLOY_TG" \
                             --targets "Id=$DEPLOY_INSTANCE" \
-                            --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+                            --query \
+                            'TargetHealthDescriptions[0].TargetHealth.State' \
                             --output text
                         )
 
@@ -234,33 +341,41 @@ EOF
 
         stage('Switch Production Traffic') {
             steps {
-                sh '''
-                    cat > listener-switch.json <<EOF
-[
+                script {
+
+                    writeFile(
+                        file: 'listener-switch.json',
+                        text: """[
   {
     "Type": "forward",
     "ForwardConfig": {
       "TargetGroups": [
         {
-          "TargetGroupArn": "$ACTIVE_TG",
+          "TargetGroupArn": "${env.ACTIVE_TG}",
           "Weight": 0
         },
         {
-          "TargetGroupArn": "$DEPLOY_TG",
+          "TargetGroupArn": "${env.DEPLOY_TG}",
           "Weight": 100
         }
       ]
     }
   }
 ]
-EOF
+"""
+                    )
+                }
+
+                sh '''
+                    echo "Switching production traffic..."
+                    echo "$ACTIVE_ENV -> $DEPLOY_ENV"
 
                     $AWS_CLI elbv2 modify-listener \
                       --listener-arn "$LISTENER_ARN" \
                       --default-actions file://listener-switch.json \
                       >/dev/null
 
-                    echo "Traffic switched: $ACTIVE_ENV -> $DEPLOY_ENV"
+                    echo "Traffic switched successfully."
                 '''
             }
         }
@@ -270,49 +385,53 @@ EOF
                 sh '''
                     SUCCESS=false
 
+                    echo "Verifying production through ALB..."
+
                     for attempt in $(seq 1 10)
                     do
-                        if curl -fsS "http://$ALB_DNS" > production-response.html
+
+                        if curl -fsS \
+                          "http://$ALB_DNS" \
+                          > production-response.html
                         then
-                            if grep -q "Version: $APP_VERSION" production-response.html &&
-                               grep -q "Environment: $DEPLOY_ENV" production-response.html
+
+                            if grep -q \
+                              "Version: $APP_VERSION" \
+                              production-response.html &&
+                               grep -q \
+                              "Environment: $DEPLOY_ENV" \
+                              production-response.html
                             then
+
                                 SUCCESS=true
                                 break
                             fi
                         fi
 
                         echo "Production verification attempt $attempt failed."
+
                         sleep 5
                     done
 
                     if [ "$SUCCESS" = "true" ]; then
-                        echo "Deployment verified successfully."
+
+                        echo "================================="
+                        echo "DEPLOYMENT SUCCESSFUL"
+                        echo "================================="
+
+                        echo "Version: $APP_VERSION"
+                        echo "Environment: $DEPLOY_ENV"
+
                         cat production-response.html
+
                         exit 0
                     fi
 
-                    echo "Verification failed. Rolling traffic back to $ACTIVE_ENV."
+                    echo "================================="
+                    echo "PRODUCTION VERIFICATION FAILED"
+                    echo "================================="
 
-                    cat > listener-rollback.json <<EOF
-[
-  {
-    "Type": "forward",
-    "ForwardConfig": {
-      "TargetGroups": [
-        {
-          "TargetGroupArn": "$ACTIVE_TG",
-          "Weight": 100
-        },
-        {
-          "TargetGroupArn": "$DEPLOY_TG",
-          "Weight": 0
-        }
-      ]
-    }
-  }
-]
-EOF
+                    echo "Rolling traffic back to $ACTIVE_ENV..."
 
                     $AWS_CLI elbv2 modify-listener \
                       --listener-arn "$LISTENER_ARN" \
@@ -320,6 +439,8 @@ EOF
                       >/dev/null
 
                     echo "Rollback completed."
+                    echo "$ACTIVE_ENV is LIVE again."
+
                     exit 1
                 '''
             }
@@ -327,6 +448,7 @@ EOF
     }
 
     post {
+
         success {
             echo 'Blue/Green deployment completed successfully.'
         }
@@ -337,9 +459,15 @@ EOF
 
         always {
             sh '''
-                docker rm -f bluegreen-ci-test >/dev/null 2>&1 || true
-                rm -f listener-prep.json listener-switch.json listener-rollback.json
-                rm -f ssm-params.json ci-response.html production-response.html
+                docker rm -f bluegreen-ci-test \
+                  >/dev/null 2>&1 || true
+
+                rm -f listener-prep.json
+                rm -f listener-switch.json
+                rm -f listener-rollback.json
+                rm -f ssm-params.json
+                rm -f ci-response.html
+                rm -f production-response.html
             '''
         }
     }
