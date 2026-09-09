@@ -22,9 +22,6 @@ pipeline {
 
         ECR_REPO = '849808307461.dkr.ecr.ap-south-1.amazonaws.com/bluegreen-cicd-app'
 
-        BLUE_INSTANCE  = 'i-0d6bdc2e55911bfb5'
-        GREEN_INSTANCE = 'i-090717305108a64a3'
-
         BLUE_TG = 'arn:aws:elasticloadbalancing:ap-south-1:849808307461:targetgroup/bluegreen-cicd-blue-tg/df3f77f6ad1b089c'
 
         GREEN_TG = 'arn:aws:elasticloadbalancing:ap-south-1:849808307461:targetgroup/bluegreen-cicd-green-tg/1e159b53ced6344e'
@@ -62,7 +59,7 @@ pipeline {
                      *
                      * GitHub webhook:
                      * If APP_VERSION is empty, Jenkins automatically
-                     * creates a version such as build-4.
+                     * creates a version such as build-8.
                      */
 
                     def version = params.APP_VERSION?.trim()
@@ -73,8 +70,59 @@ pipeline {
 
                     env.APP_VERSION = version
 
-                    echo "Application version: ${env.APP_VERSION}"
+                    /*
+                     * Find BLUE EC2 dynamically using AWS tag.
+                     */
+                    def blueInstance = sh(
+                        script: '''
+                            $AWS_CLI ec2 describe-instances \
+                              --region "$AWS_REGION" \
+                              --filters \
+                                "Name=tag:Name,Values=bluegreen-cicd-blue" \
+                                "Name=instance-state-name,Values=running" \
+                              --query 'Reservations[].Instances[].InstanceId | [0]' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
 
+                    /*
+                     * Find GREEN EC2 dynamically using AWS tag.
+                     */
+                    def greenInstance = sh(
+                        script: '''
+                            $AWS_CLI ec2 describe-instances \
+                              --region "$AWS_REGION" \
+                              --filters \
+                                "Name=tag:Name,Values=bluegreen-cicd-green" \
+                                "Name=instance-state-name,Values=running" \
+                              --query 'Reservations[].Instances[].InstanceId | [0]' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    /*
+                     * Stop pipeline if either server cannot be found.
+                     */
+                    if (!blueInstance || blueInstance == 'None') {
+                        error("Unable to find running BLUE EC2 instance")
+                    }
+
+                    if (!greenInstance || greenInstance == 'None') {
+                        error("Unable to find running GREEN EC2 instance")
+                    }
+
+                    env.BLUE_INSTANCE = blueInstance
+                    env.GREEN_INSTANCE = greenInstance
+
+                    echo "Application version: ${env.APP_VERSION}"
+                    echo "BLUE instance: ${env.BLUE_INSTANCE}"
+                    echo "GREEN instance: ${env.GREEN_INSTANCE}"
+
+                    /*
+                     * Find which Target Group currently has weight 100.
+                     */
                     def activeTg = sh(
                         script: '''
                             $AWS_CLI elbv2 describe-listeners \
@@ -110,6 +158,7 @@ pipeline {
 
                     echo "Current LIVE environment: ${env.ACTIVE_ENV}"
                     echo "Deploying version ${env.APP_VERSION} to: ${env.DEPLOY_ENV}"
+                    echo "Deployment instance: ${env.DEPLOY_INSTANCE}"
                 }
             }
         }
