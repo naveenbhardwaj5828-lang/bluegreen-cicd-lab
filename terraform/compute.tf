@@ -14,25 +14,31 @@ data "aws_ami" "ubuntu" {
 }
 
 locals {
-  app_user_data = <<-EOF
+  app_user_data = <<-USERDATA
     #!/bin/bash
     set -e
 
     apt-get update
-    apt-get install -y docker.io awscli
+    DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io curl unzip
 
     systemctl enable docker
     systemctl start docker
 
     usermod -aG docker ubuntu
 
+    # Install official AWS CLI v2
+    cd /tmp
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+    unzip -q -o awscliv2.zip
+    ./aws/install
+
     # Ensure AWS Systems Manager Agent is available
     if ! snap list amazon-ssm-agent >/dev/null 2>&1; then
       snap install amazon-ssm-agent --classic
     fi
 
-    snap start amazon-ssm-agent || true
-  EOF
+    systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service || true
+  USERDATA
 }
 
 resource "aws_instance" "blue" {
@@ -44,7 +50,8 @@ resource "aws_instance" "blue" {
 
   iam_instance_profile = aws_iam_instance_profile.app_ec2.name
 
-  user_data = local.app_user_data
+  user_data                   = local.app_user_data
+  user_data_replace_on_change = true
 
   root_block_device {
     volume_size = 20
@@ -66,7 +73,8 @@ resource "aws_instance" "green" {
 
   iam_instance_profile = aws_iam_instance_profile.app_ec2.name
 
-  user_data = local.app_user_data
+  user_data                   = local.app_user_data
+  user_data_replace_on_change = true
 
   root_block_device {
     volume_size = 20
