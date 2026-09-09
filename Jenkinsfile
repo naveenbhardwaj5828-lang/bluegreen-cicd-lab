@@ -10,8 +10,8 @@ pipeline {
     parameters {
         string(
             name: 'APP_VERSION',
-            defaultValue: '1.2.0',
-            description: 'Docker image version to deploy'
+            defaultValue: '',
+            description: 'Docker image version to deploy. Leave blank for automatic build number.'
         )
     }
 
@@ -57,14 +57,18 @@ pipeline {
                 script {
 
                     /*
-                     * APP_VERSION comes from the Jenkins parameter.
-                     * The fallback also protects the first/older build
-                     * where Jenkins may not yet have registered parameters.
+                     * Manual build:
+                     * User can enter APP_VERSION such as 1.3.0
+                     *
+                     * GitHub webhook:
+                     * If APP_VERSION is empty, Jenkins automatically
+                     * creates a version such as build-4.
                      */
+
                     def version = params.APP_VERSION?.trim()
 
                     if (!version) {
-                        version = '1.2.0'
+                        version = "build-${env.BUILD_NUMBER}"
                     }
 
                     env.APP_VERSION = version
@@ -204,10 +208,6 @@ pipeline {
 """
                     )
 
-                    /*
-                     * This is also our rollback configuration.
-                     * ACTIVE gets 100%, new environment gets 0%.
-                     */
                     writeFile(
                         file: 'listener-rollback.json',
                         text: """[
